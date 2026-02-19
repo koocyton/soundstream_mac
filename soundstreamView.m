@@ -1,7 +1,4 @@
 #import "soundstreamView.h"
-#import <AudioToolbox/AudioToolbox.h>
-#import <Accelerate/Accelerate.h>
-#import <AVFoundation/AVFoundation.h>
 
 #ifndef GL_SILENCE_DEPRECATION
 #define GL_SILENCE_DEPRECATION
@@ -12,67 +9,23 @@
 #define MAX_STREAMS         1
 #define PARTICLES_PER_STREAM 900
 #define TOTAL_PARTICLES     (MAX_STREAMS * PARTICLES_PER_STREAM)
-#define SPECTRUM_BANDS      16
-#define AUDIO_BUF_SIZE      1024
 
-#pragma mark - Audio
+static void sslog(const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    NSLog(@"SOUNDSTREAM: %s", buf);
 
-typedef struct {
-    float level;
-    float peak;
-    float smoothLevel;
-    float spectrum[SPECTRUM_BANDS];
-    BOOL  active;
-} AudioState;
-
-static AudioState gAudio = {0};
-
-static void audioInputCallback(void *userData,
-                               AudioQueueRef queue,
-                               AudioQueueBufferRef buf,
-                               const AudioTimeStamp *time,
-                               UInt32 count,
-                               const AudioStreamPacketDescription *desc) {
-    float *samples = (float *)buf->mAudioData;
-    UInt32 frames = buf->mAudioDataByteSize / sizeof(float);
-    if (frames == 0) { AudioQueueEnqueueBuffer(queue, buf, 0, NULL); return; }
-
-    gAudio.active = YES;
-    float rms = 0;
-    vDSP_rmsqv(samples, 1, &rms, frames);
-    if (rms > 1.0f) rms = 1.0f;
-    if (!isfinite(rms)) rms = 0;
-
-    gAudio.level = rms;
-    gAudio.smoothLevel = gAudio.smoothLevel * 0.85f + rms * 0.15f;
-    if (rms > gAudio.peak) gAudio.peak = rms;
-    else gAudio.peak *= 0.97f;
-
-    if (frames >= AUDIO_BUF_SIZE) {
-        static FFTSetup fftSetup = NULL;
-        static float window[AUDIO_BUF_SIZE];
-        if (!fftSetup) {
-            fftSetup = vDSP_create_fftsetup((int)log2f(AUDIO_BUF_SIZE), kFFTRadix2);
-            vDSP_hann_window(window, AUDIO_BUF_SIZE, vDSP_HANN_NORM);
-        }
-        float windowed[AUDIO_BUF_SIZE];
-        vDSP_vmul(samples, 1, window, 1, windowed, 1, AUDIO_BUF_SIZE);
-        float realp[AUDIO_BUF_SIZE/2], imagp[AUDIO_BUF_SIZE/2];
-        DSPSplitComplex split = { realp, imagp };
-        vDSP_ctoz((DSPComplex *)windowed, 2, &split, 1, AUDIO_BUF_SIZE/2);
-        vDSP_fft_zrip(fftSetup, &split, 1, (int)log2f(AUDIO_BUF_SIZE), FFT_FORWARD);
-        float mags[AUDIO_BUF_SIZE/2];
-        vDSP_zvmags(&split, 1, mags, 1, AUDIO_BUF_SIZE/2);
-        int binsPerBand = (AUDIO_BUF_SIZE/2) / SPECTRUM_BANDS;
-        for (int i = 0; i < SPECTRUM_BANDS; i++) {
-            float sum = 0;
-            for (int j = i*binsPerBand; j < (i+1)*binsPerBand; j++) sum += mags[j];
-            float val = sqrtf(sum / binsPerBand) * 0.01f;
-            if (val > 1.0f) val = 1.0f;
-            gAudio.spectrum[i] = gAudio.spectrum[i] * 0.7f + val * 0.3f;
-        }
+    static FILE *logFile = NULL;
+    if (!logFile) {
+        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
+        NSString *logPath = [[paths firstObject] stringByAppendingPathComponent:@"Logs/soundstream_debug.log"];
+        logFile = fopen([logPath UTF8String], "a");
+        if (!logFile) logFile = fopen("/tmp/soundstream_debug.log", "a");
     }
-    AudioQueueEnqueueBuffer(queue, buf, 0, NULL);
+    if (logFile) { fprintf(logFile, "%s\n", buf); fflush(logFile); }
 }
 
 #pragma mark - Particle & Stream
@@ -83,7 +36,6 @@ typedef struct {
     float life, maxLife;
     float size;
     float opacity;
-    BOOL isBurst;
 } Particle;
 
 typedef struct {
@@ -118,7 +70,6 @@ static float randf(void) { return (float)arc4random_uniform(10000) / 10000.0f; }
 
 @interface soundstreamView () {
     NSOpenGLView *_glView;
-    AudioQueueRef _audioQueue;
 
     Particle   _particles[TOTAL_PARTICLES];
     StreamHead _heads[MAX_STREAMS];
@@ -126,7 +77,6 @@ static float randf(void) { return (float)arc4random_uniform(10000) / 10000.0f; }
     float _time;
     float _hue;
     float _aspect;
-    float _prevLevel;
 
     BOOL _glReady;
 }
@@ -137,12 +87,13 @@ static float randf(void) { return (float)arc4random_uniform(10000) / 10000.0f; }
 - (instancetype)initWithFrame:(NSRect)frame isPreview:(BOOL)isPreview {
     self = [super initWithFrame:frame isPreview:isPreview];
     if (self) {
+        sslog("=== initWithFrame called, isPreview=%d, frame=%.0fx%.0f ===",
+              isPreview, frame.size.width, frame.size.height);
         [self setAnimationTimeInterval:1.0 / 60.0];
         _time = 0;
         _hue = randf();
         _glReady = NO;
         _aspect = 16.0f / 9.0f;
-        _prevLevel = 0;
 
         for (int s = 0; s < MAX_STREAMS; s++) {
             _heads[s].x = 0;
@@ -204,44 +155,10 @@ static float randf(void) { return (float)arc4random_uniform(10000) / 10000.0f; }
 - (void)startAnimation {
     [super startAnimation];
     [self setupGLIfNeeded];
-
-    AudioStreamBasicDescription fmt = {0};
-    fmt.mSampleRate = 44100;
-    fmt.mFormatID = kAudioFormatLinearPCM;
-    fmt.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
-    fmt.mBitsPerChannel = 32;
-    fmt.mChannelsPerFrame = 1;
-    fmt.mBytesPerFrame = sizeof(float);
-    fmt.mFramesPerPacket = 1;
-    fmt.mBytesPerPacket = sizeof(float);
-
-    [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:^(BOOL granted) {
-        NSLog(@"[Soundstream] Mic permission granted: %d", granted);
-        if (!granted) return;
-
-        AudioQueueRef queue = NULL;
-        OSStatus status = AudioQueueNewInput(&fmt, audioInputCallback, NULL, NULL, NULL, 0, &queue);
-        NSLog(@"[Soundstream] AudioQueueNewInput status: %d", (int)status);
-        if (status == noErr && queue) {
-            UInt32 bufSize = AUDIO_BUF_SIZE * sizeof(float);
-            for (int i = 0; i < 3; i++) {
-                AudioQueueBufferRef buf;
-                AudioQueueAllocateBuffer(queue, bufSize, &buf);
-                AudioQueueEnqueueBuffer(queue, buf, 0, NULL);
-            }
-            OSStatus startStatus = AudioQueueStart(queue, NULL);
-            NSLog(@"[Soundstream] AudioQueueStart status: %d", (int)startStatus);
-            self->_audioQueue = queue;
-        }
-    }];
+    sslog("startAnimation called");
 }
 
 - (void)stopAnimation {
-    if (_audioQueue) {
-        AudioQueueStop(_audioQueue, true);
-        AudioQueueDispose(_audioQueue, true);
-        _audioQueue = NULL;
-    }
     [super stopAnimation];
 }
 
@@ -338,22 +255,10 @@ static float randf(void) { return (float)arc4random_uniform(10000) / 10000.0f; }
     _aspect = size.width / size.height;
     float scaleFactor = _glView.window ? _glView.window.backingScaleFactor : 1.0f;
 
-    float audioEnergy = gAudio.active ? gAudio.smoothLevel : 0;
-
-    // Update stream heads
     for (int s = 0; s < MAX_STREAMS; s++) {
-        _heads[s].maxSpeed = 2.0f + audioEnergy * 4.0f;
+        _heads[s].maxSpeed = 2.0f;
         [self updateHead:&_heads[s] dt:dt];
     }
-
-    // Sound response: continuous spread based on volume
-    float soundSpread = audioEnergy * 8.0f;
-
-    // Burst detection: sudden loud sound
-    float currentLevel = gAudio.level;
-    float jump = currentLevel - _prevLevel;
-    _prevLevel = currentLevel;
-    BOOL burst = (gAudio.active && currentLevel > 0.05f && jump > 0.02f);
 
     // Emit trail particles for each stream
     for (int s = 0; s < MAX_STREAMS; s++) {
@@ -369,15 +274,13 @@ static float randf(void) { return (float)arc4random_uniform(10000) / 10000.0f; }
             Particle *p = &_particles[base + j];
             if (p->life > 0) continue;
 
-            float spread = 0.04f + (1.0f - speedRatio) * 0.06f + soundSpread * 0.05f;
+            float spread = 0.04f + (1.0f - speedRatio) * 0.06f;
             p->x = h->x + (randf() - 0.5f) * spread;
             p->y = h->y + (randf() - 0.5f) * spread;
 
-            float fan = (randf() - 0.5f) * (0.7f + soundSpread * 0.5f);
+            float fan = (randf() - 0.5f) * 0.7f;
             float driftAngle = tailAngle + fan;
             float driftSpeed = h->speed * (0.02f + randf() * 0.06f) + randf() * 0.01f;
-            // Sound adds outward drift
-            driftSpeed += soundSpread * 0.05f;
             p->vx = cosf(driftAngle) * driftSpeed;
             p->vy = sinf(driftAngle) * driftSpeed;
 
@@ -385,36 +288,9 @@ static float randf(void) { return (float)arc4random_uniform(10000) / 10000.0f; }
             p->life = p->maxLife;
             p->size = 3.0f + randf() * 5.0f + speedRatio * 5.0f;
             p->opacity = 0.4f + speedRatio * 0.4f;
-            p->isBurst = NO;
             emitted++;
         }
 
-        // Continuous sound push: all live particles get pushed outward from head
-        if (gAudio.active && audioEnergy > 0.01f) {
-            float pushForce = audioEnergy * 2.0f;
-            for (int j = 0; j < PARTICLES_PER_STREAM; j++) {
-                Particle *p = &_particles[base + j];
-                if (p->life <= 0) continue;
-                float dx = p->x - h->x;
-                float dy = p->y - h->y;
-                float dist = sqrtf(dx * dx + dy * dy) + 0.001f;
-                p->vx += (dx / dist) * pushForce * dt;
-                p->vy += (dy / dist) * pushForce * dt;
-            }
-        }
-
-        // Burst on loud sound: strong explosion
-        if (burst) {
-            float burstStrength = 0.5f + currentLevel * 3.0f;
-            for (int j = 0; j < PARTICLES_PER_STREAM; j++) {
-                Particle *p = &_particles[base + j];
-                if (p->life <= 0) continue;
-                float bAngle = randf() * M_PI * 2.0f;
-                float bSpeed = burstStrength * (0.3f + randf() * 0.7f);
-                p->vx += cosf(bAngle) * bSpeed;
-                p->vy += sinf(bAngle) * bSpeed;
-            }
-        }
     }
 
     // Update all particles

@@ -22,7 +22,5 @@
 	<string>Copyright © 2026 Henry. All rights reserved.</string>
 	<key>NSPrincipalClass</key>
 	<string>soundstreamView</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>Soundstream needs microphone access to visualize audio as flowing particles.</string>
 </dict>
 </plist>
