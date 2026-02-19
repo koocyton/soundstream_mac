@@ -21,6 +21,8 @@
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026 Henry. All rights reserved.</string>
 	<key>NSPrincipalClass</key>
-	<string>soundstreamView</string>
+	<string>SoundStream2.SoundstreamView</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>SoundStream2 captures system audio to visualize sound as flowing particles.</string>
 </dict>
 </plist>
